@@ -3,6 +3,7 @@ import jwt
 from jwt import PyJWKClient
 from typing import TypedDict, Literal, Optional
 import psycopg2
+from psycopg2 import pool
 from pymilvus import connections, Collection
 from openai import OpenAI
 from langgraph.graph import StateGraph, START, END
@@ -18,19 +19,32 @@ class AgentState(TypedDict):
 
 client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
+# Initialize thread-safe connection pool globally for the application lifecycle
+try:
+    db_pool = psycopg2.pool.ThreadedConnectionPool(
+        minconn=1,
+        maxconn=20,
+        dbname=os.getenv("POSTGRES_DB", "enterprise_db"),
+        user=os.getenv("POSTGRES_USER", "postgres"),
+        password=os.getenv("POSTGRES_PASSWORD", "password"),
+        host=os.getenv("POSTGRES_HOST", "localhost"),
+        port=os.getenv("POSTGRES_PORT", "5432")
+    )
+except Exception as e:
+    print(f"CRITICAL: Failed to initialize database connection pool: {e}")
+    db_pool = None
+
 # 2. Authentication Node
 def auth_node(state: AgentState) -> dict:
     """Verifies the OAuth2 Bearer token using JWKS and extracts the user's email."""
     token = state.get("token", "")
     try:
-        # Standard configuration for providers like Auth0, Okta, Google
         jwks_url = os.environ.get("OAUTH2_JWKS_URL", "https://your-idp-domain.com/.well-known/jwks.json")
         audience = os.environ.get("OAUTH2_AUDIENCE", "your-api-audience")
         
         jwks_client = PyJWKClient(jwks_url)
         signing_key = jwks_client.get_signing_key_from_jwt(token)
         
-        # Validates cryptorgaphic signature, expiration (exp), and audience (aud)
         payload = jwt.decode(
             token,
             signing_key.key,
@@ -118,22 +132,29 @@ def sql_agent_node(state: AgentState) -> dict:
         temperature=0.0
     ).choices[0].message.content.strip().replace("```sql", "").replace("```", "")
     
+    if not db_pool:
+        return {"agent_raw_data": "System Error: Database connection pool is unavailable."}
+        
+    conn = None
     try:
-        conn = psycopg2.connect(
-            dbname=os.getenv("POSTGRES_DB", "enterprise_db"),
-            user=os.getenv("POSTGRES_USER", "postgres"),
-            password=os.getenv("POSTGRES_PASSWORD", "password"),
-            host=os.getenv("POSTGRES_HOST", "localhost")
-        )
-        cursor = conn.cursor()
-        cursor.execute(sql_query)
-        records = cursor.fetchall()
-        cursor.close()
-        conn.close()
+        # Check out an active connection from the thread-safe pool
+        conn = db_pool.getconn()
+        with conn.cursor() as cursor:
+            cursor.execute(sql_query)
+            records = cursor.fetchall()
+            
+        # Optional: ensure clean transaction boundary
+        conn.commit()
         data_str = f"SQL Executed: {sql_query}\nFetched Rows: {str(records)}"
     except Exception as e:
-        data_str = f"SQL Generation or execution failed: {str(e)}"
-        
+        if conn:
+            conn.rollback()
+        data_str = f"SQL execution failed: {str(e)}"
+    finally:
+        if conn:
+            # CRITICAL: Always return the connection to the pool to prevent resource exhaustion
+            db_pool.putconn(conn)
+            
     return {"agent_raw_data": data_str}
 
 # Agent 2: Milvus RAG Vector Node
